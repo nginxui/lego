@@ -4,10 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/lightsail"
-	"github.com/go-acme/lego/v4/providers/dns/internal/ptr"
+	"github.com/go-acme/lego/v4/providers/dns/internal/awsclient"
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,11 +28,13 @@ func TestLiveTTL(t *testing.T) {
 
 	ctx := context.Background()
 
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	// Load credentials for verification
+	config := &Config{Region: "us-east-1"}
+	creds, err := loadAWSCredentials(config)
 	require.NoError(t, err)
 
-	svc := lightsail.NewFromConfig(cfg)
-	require.NoError(t, err)
+	// Create a client for verification
+	client := NewLightsailClient(creds, maxRetries)
 
 	defer func() {
 		errC := provider.CleanUp(domain, "foo", "bar")
@@ -44,16 +43,16 @@ func TestLiveTTL(t *testing.T) {
 		}
 	}()
 
-	params := &lightsail.GetDomainInput{
-		DomainName: aws.String(domain),
+	request := &GetDomainRequest{
+		DomainName: domain,
 	}
 
-	resp, err := svc.GetDomain(ctx, params)
+	resp, err := client.GetDomain(ctx, request)
 	require.NoError(t, err)
 
 	entries := resp.Domain.DomainEntries
 	for _, entry := range entries {
-		if ptr.Deref(entry.Type) == "TXT" && ptr.Deref(entry.Name) == fqdn {
+		if awsclient.StringValue(entry.Type) == "TXT" && awsclient.StringValue(entry.Name) == fqdn {
 			return
 		}
 	}

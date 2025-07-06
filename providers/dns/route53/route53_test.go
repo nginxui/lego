@@ -6,11 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/route53"
 	"github.com/go-acme/lego/v4/platform/tester"
+	"github.com/go-acme/lego/v4/providers/dns/internal/awsclient"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -34,55 +31,19 @@ var envTest = tester.NewEnvTest(
 func makeTestProvider(t *testing.T, serverURL string) *DNSProvider {
 	t.Helper()
 
-	cfg := aws.Config{
-		Credentials:      credentials.NewStaticCredentialsProvider("abc", "123", " "),
-		Region:           "mock-region",
-		BaseEndpoint:     aws.String(serverURL),
-		RetryMaxAttempts: 1,
+	creds := &awsclient.AWSCredentials{
+		AccessKeyID:     "abc",
+		SecretAccessKey: "123",
+		SessionToken:    " ",
+		Region:          "mock-region",
 	}
+
+	client := NewRoute53ClientWithEndpoint(creds, 1, serverURL)
 
 	return &DNSProvider{
-		client: route53.NewFromConfig(cfg),
+		client: client,
 		config: NewDefaultConfig(),
 	}
-}
-
-func Test_loadCredentials_FromEnv(t *testing.T) {
-	defer envTest.RestoreEnv()
-	envTest.ClearEnv()
-
-	_ = os.Setenv(EnvAccessKeyID, "123")
-	_ = os.Setenv(EnvSecretAccessKey, "456")
-	_ = os.Setenv(EnvRegion, "us-east-1")
-
-	ctx := context.Background()
-
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
-	require.NoError(t, err)
-
-	value, err := cfg.Credentials.Retrieve(ctx)
-	require.NoError(t, err, "Expected credentials to be set from environment")
-
-	expected := aws.Credentials{
-		AccessKeyID:     "123",
-		SecretAccessKey: "456",
-		SessionToken:    "",
-		Source:          "EnvConfigCredentials",
-	}
-
-	assert.Equal(t, expected, value)
-}
-
-func Test_loadRegion_FromEnv(t *testing.T) {
-	defer envTest.RestoreEnv()
-	envTest.ClearEnv()
-
-	_ = os.Setenv(EnvRegion, "foo")
-
-	cfg, err := awsconfig.LoadDefaultConfig(context.Background())
-	require.NoError(t, err)
-
-	assert.Equal(t, "foo", cfg.Region, "Region")
 }
 
 func Test_getHostedZoneID_FromEnv(t *testing.T) {
@@ -92,6 +53,8 @@ func Test_getHostedZoneID_FromEnv(t *testing.T) {
 	expectedZoneID := "zoneID"
 
 	_ = os.Setenv(EnvHostedZoneID, expectedZoneID)
+	_ = os.Setenv(EnvAccessKeyID, "test-key")
+	_ = os.Setenv(EnvSecretAccessKey, "test-secret")
 
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
@@ -156,9 +119,9 @@ func TestNewDefaultConfig(t *testing.T) {
 
 func TestDNSProvider_Present(t *testing.T) {
 	mockResponses := MockResponseMap{
-		"/2013-04-01/hostedzonesbyname":        {StatusCode: 200, Body: ListHostedZonesByNameResponse},
-		"/2013-04-01/hostedzone/ABCDEFG/rrset": {StatusCode: 200, Body: ChangeResourceRecordSetsResponse},
-		"/2013-04-01/change/123456":            {StatusCode: 200, Body: GetChangeResponse},
+		"/2013-04-01/hostedzonesbyname":        {StatusCode: 200, Body: ListHostedZonesByNameResponseBody},
+		"/2013-04-01/hostedzone/ABCDEFG/rrset": {StatusCode: 200, Body: ChangeResourceRecordSetsResponseBody},
+		"/2013-04-01/change/123456":            {StatusCode: 200, Body: GetChangeResponseBody},
 		"/2013-04-01/hostedzone/ABCDEFG/rrset?name=_acme-challenge.example.com.&type=TXT": {
 			StatusCode: 200,
 			Body:       "",
@@ -178,51 +141,25 @@ func TestDNSProvider_Present(t *testing.T) {
 	require.NoError(t, err, "Expected Present to return no error")
 }
 
-func Test_createAWSConfig(t *testing.T) {
+func Test_loadAWSCredentials(t *testing.T) {
 	testCases := []struct {
-		desc             string
-		env              map[string]string
-		config           *Config
-		wantCreds        aws.Credentials
-		wantDefaultChain bool
-		wantRegion       string
-		wantErr          string
+		desc      string
+		env       map[string]string
+		config    *Config
+		wantCreds *awsclient.AWSCredentials
+		wantErr   string
 	}{
-		{
-			desc:    "config is nil",
-			wantErr: "config is nil",
-		},
-		{
-			desc:    "session token without access key id or secret access key",
-			config:  &Config{SessionToken: "foo"},
-			wantErr: "SessionToken must be supplied with AccessKeyID and SecretAccessKey",
-		},
-		{
-			desc:    "access key id without secret access key",
-			config:  &Config{AccessKeyID: "foo"},
-			wantErr: "AccessKeyID and SecretAccessKey must be supplied together",
-		},
-		{
-			desc:    "access key id without secret access key",
-			config:  &Config{SecretAccessKey: "foo"},
-			wantErr: "AccessKeyID and SecretAccessKey must be supplied together",
-		},
-		{
-			desc:             "credentials from default chain",
-			config:           &Config{},
-			wantDefaultChain: true,
-		},
 		{
 			desc: "static credentials",
 			config: &Config{
 				AccessKeyID:     "one",
 				SecretAccessKey: "two",
 			},
-			wantCreds: aws.Credentials{
+			wantCreds: &awsclient.AWSCredentials{
 				AccessKeyID:     "one",
 				SecretAccessKey: "two",
 				SessionToken:    "",
-				Source:          credentials.StaticCredentialsName,
+				Region:          "us-east-1",
 			},
 		},
 		{
@@ -232,32 +169,47 @@ func Test_createAWSConfig(t *testing.T) {
 				SecretAccessKey: "two",
 				SessionToken:    "three",
 			},
-			wantCreds: aws.Credentials{
+			wantCreds: &awsclient.AWSCredentials{
 				AccessKeyID:     "one",
 				SecretAccessKey: "two",
 				SessionToken:    "three",
-				Source:          credentials.StaticCredentialsName,
+				Region:          "us-east-1",
 			},
 		},
 		{
-			desc:   "region from env",
+			desc: "static credentials with region",
+			config: &Config{
+				AccessKeyID:     "one",
+				SecretAccessKey: "two",
+				Region:          "us-west-2",
+			},
+			wantCreds: &awsclient.AWSCredentials{
+				AccessKeyID:     "one",
+				SecretAccessKey: "two",
+				SessionToken:    "",
+				Region:          "us-west-2",
+			},
+		},
+		{
+			desc:   "credentials from env",
 			config: &Config{},
 			env: map[string]string{
-				"AWS_REGION": "foo",
+				"AWS_ACCESS_KEY_ID":     "env-key",
+				"AWS_SECRET_ACCESS_KEY": "env-secret",
+				"AWS_REGION":            "env-region",
 			},
-			wantDefaultChain: true,
-			wantRegion:       "foo",
+			wantCreds: &awsclient.AWSCredentials{
+				AccessKeyID:     "env-key",
+				SecretAccessKey: "env-secret",
+				SessionToken:    "",
+				Region:          "env-region",
+			},
 		},
 		{
-			desc: "static region",
-			config: &Config{
-				Region: "one",
-			},
-			env: map[string]string{
-				"AWS_REGION": "foo",
-			},
-			wantDefaultChain: true,
-			wantRegion:       "one",
+			desc:    "missing credentials",
+			config:  &Config{},
+			env:     map[string]string{},
+			wantErr: "AWS credentials not found. Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables",
 		},
 	}
 
@@ -268,27 +220,14 @@ func Test_createAWSConfig(t *testing.T) {
 
 			envTest.Apply(test.env)
 
-			ctx := context.Background()
-
-			cfg, err := createAWSConfig(ctx, test.config)
+			creds, err := loadAWSCredentials(test.config)
 			requireErr(t, err, test.wantErr)
 
 			if err != nil {
 				return
 			}
 
-			gotCreds, err := cfg.Credentials.Retrieve(ctx)
-
-			if test.wantDefaultChain {
-				assert.NotEqual(t, credentials.StaticCredentialsName, gotCreds.Source)
-			} else {
-				require.NoError(t, err)
-				assert.Equal(t, test.wantCreds, gotCreds)
-			}
-
-			if test.wantRegion != "" {
-				assert.Equal(t, test.wantRegion, cfg.Region)
-			}
+			assert.Equal(t, test.wantCreds, creds)
 		})
 	}
 }

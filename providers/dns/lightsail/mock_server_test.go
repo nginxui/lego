@@ -27,7 +27,7 @@ func newMockServer(t *testing.T, responses map[string]MockResponse) string {
 			require.FailNow(t, msg)
 		}
 
-		w.Header().Set("Content-Type", "application/xml")
+		w.Header().Set("Content-Type", "application/x-amz-json-1.1")
 		w.WriteHeader(resp.StatusCode)
 		_, err := w.Write([]byte(resp.Body))
 		if err != nil {

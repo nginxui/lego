@@ -25,13 +25,32 @@ The AWS Region is automatically detected in the following locations and prioriti
 1. Environment variables: `AWS_REGION`
 2. Shared configuration file if `AWS_SDK_LOAD_CONFIG` is set (defaults to `~/.aws/config`, profiles can be specified using `AWS_PROFILE`)
 
-See also: https://aws.github.io/aws-sdk-go-v2/docs/configuring-sdk/
+### S3 Bucket Configuration
 
-### Broad privileges for testing purposes
+The S3 bucket must be configured to allow public read access for the HTTP-01 challenge to work.
+You can achieve this by:
 
-Will need to create an S3 bucket which has read permissions set for Everyone (public access).
-The S3 bucket doesn't require static website hosting to be enabled.
-AWS_REGION must match the region where the s3 bucket is hosted.
+1. **Bucket Policy**: Set a bucket policy that allows public read access to challenge files
+2. **Public Access Settings**: Ensure the bucket allows public read access
+3. **Static Website Hosting**: Not required, but can be enabled if desired
+
+Example bucket policy for public read access:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PublicReadGetObject",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::your-bucket-name/*"
+    }
+  ]
+}
+```
+
+**Important**: AWS_REGION must match the region where the S3 bucket is hosted.
 '''
 
 [Configuration]
