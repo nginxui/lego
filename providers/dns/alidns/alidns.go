@@ -2,18 +2,16 @@
 package alidns
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
 
-	alidns "github.com/alibabacloud-go/alidns-20150109/v4/client"
-	openapi "github.com/alibabacloud-go/darabonba-openapi/v2/client"
-	"github.com/aliyun/credentials-go/credentials"
 	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
-	"github.com/go-acme/lego/v4/providers/dns/internal/ptr"
-	"golang.org/x/net/idna"
+	"github.com/libdns/alidns"
+	"github.com/libdns/libdns"
 )
 
 // Environment variables names.
@@ -62,7 +60,7 @@ func NewDefaultConfig() *Config {
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
 	config *Config
-	client *alidns.Client
+	client *alidns.Provider
 }
 
 // NewDNSProvider returns a DNSProvider instance configured for Alibaba Cloud DNS.
@@ -76,7 +74,6 @@ func NewDNSProvider() (*DNSProvider, error) {
 	values, err := env.Get(EnvRAMRole)
 	if err == nil {
 		config.RAMRole = values[EnvRAMRole]
-		return NewDNSProviderConfig(config)
 	}
 
 	values, err = env.Get(EnvAccessKey, EnvSecretKey)
@@ -101,42 +98,16 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		config.RegionID = defaultRegionID
 	}
 
-	cfg := new(openapi.Config).
-		SetRegionId(config.RegionID).
-		SetReadTimeout(int(config.HTTPTimeout.Milliseconds()))
-
-	switch {
-	case config.RAMRole != "":
-		// https://www.alibabacloud.com/help/en/ecs/user-guide/attach-an-instance-ram-role-to-an-ecs-instance
-		credentialsCfg := new(credentials.Config).
-			SetType("ecs_ram_role").
-			SetRoleName(config.RAMRole)
-
-		credentialClient, err := credentials.NewCredential(credentialsCfg)
-		if err != nil {
-			return nil, fmt.Errorf("alicloud: new credential: %w", err)
-		}
-
-		cfg = cfg.SetCredential(credentialClient)
-
-	case config.APIKey != "" && config.SecretKey != "" && config.SecurityToken != "":
-		cfg = cfg.
-			SetAccessKeyId(config.APIKey).
-			SetAccessKeySecret(config.SecretKey).
-			SetSecurityToken(config.SecurityToken)
-
-	case config.APIKey != "" && config.SecretKey != "":
-		cfg = cfg.
-			SetAccessKeyId(config.APIKey).
-			SetAccessKeySecret(config.SecretKey)
-
-	default:
-		return nil, errors.New("alicloud: ram role or credentials missing")
+	if config.APIKey == "" || config.SecretKey == "" {
+		return nil, errors.New("alicloud: credentials missing")
 	}
 
-	client, err := alidns.NewClient(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("alicloud: new client: %w", err)
+	client := &alidns.Provider{
+		AccKeyID:      config.APIKey,
+		AccKeySecret:  config.SecretKey,
+		RegionID:      config.RegionID,
+		RAMRole:       config.RAMRole,
+		SecurityToken: config.SecurityToken,
 	}
 
 	return &DNSProvider{config: config, client: client}, nil
@@ -152,20 +123,32 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	zoneName, err := d.getHostedZone(info.EffectiveFQDN)
+	// Extract zone name from FQDN
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("alicloud: %w", err)
 	}
 
-	recordRequest, err := d.newTxtRecord(zoneName, info.EffectiveFQDN, info.Value)
+	zoneName := dns01.UnFqdn(authZone)
+	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, authZone)
 	if err != nil {
 		return err
 	}
 
-	_, err = d.client.AddDomainRecord(recordRequest)
-	if err != nil {
-		return fmt.Errorf("alicloud: API call failed: %w", err)
+	txtRecord := libdns.TXT{
+		Name: subDomain,
+		Text: info.Value,
+		TTL:  time.Duration(d.config.TTL) * time.Second,
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), d.config.HTTPTimeout)
+	defer cancel()
+
+	_, err = d.client.SetRecords(ctx, zoneName, []libdns.Record{txtRecord})
+	if err != nil {
+		return fmt.Errorf("alicloud: failed to create TXT record: %w", err)
+	}
+
 	return nil
 }
 
@@ -173,126 +156,41 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	records, err := d.findTxtRecords(info.EffectiveFQDN)
+	// Extract zone name from FQDN
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("alicloud: %w", err)
 	}
 
-	_, err = d.getHostedZone(info.EffectiveFQDN)
+	zoneName := dns01.UnFqdn(authZone)
+	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, authZone)
 	if err != nil {
-		return fmt.Errorf("alicloud: %w", err)
+		return err
 	}
 
-	for _, rec := range records {
-		request := &alidns.DeleteDomainRecordRequest{
-			RecordId: rec.RecordId,
+	ctx, cancel := context.WithTimeout(context.Background(), d.config.HTTPTimeout)
+	defer cancel()
+
+	// Get existing records to find the one we need to delete
+	records, err := d.client.GetRecords(ctx, zoneName)
+	if err != nil {
+		return fmt.Errorf("alicloud: failed to get records: %w", err)
+	}
+
+	var recordsToDelete []libdns.Record
+	for _, record := range records {
+		txtRecord, ok := record.(libdns.TXT)
+		if ok && txtRecord.Name == subDomain && txtRecord.Text == info.Value {
+			recordsToDelete = append(recordsToDelete, txtRecord)
 		}
+	}
 
-		_, err = d.client.DeleteDomainRecord(request)
+	if len(recordsToDelete) > 0 {
+		_, err = d.client.DeleteRecords(ctx, zoneName, recordsToDelete)
 		if err != nil {
-			return fmt.Errorf("alicloud: %w", err)
+			return fmt.Errorf("alicloud: failed to delete TXT record: %w", err)
 		}
 	}
+
 	return nil
-}
-
-func (d *DNSProvider) getHostedZone(domain string) (string, error) {
-	request := new(alidns.DescribeDomainsRequest)
-
-	var domains []*alidns.DescribeDomainsResponseBodyDomainsDomain
-
-	var startPage int64 = 1
-
-	for {
-		request.SetPageNumber(startPage)
-
-		response, err := d.client.DescribeDomains(request)
-		if err != nil {
-			return "", fmt.Errorf("API call failed: %w", err)
-		}
-
-		domains = append(domains, response.Body.Domains.Domain...)
-
-		if ptr.Deref(response.Body.PageNumber)*ptr.Deref(response.Body.PageSize) >= ptr.Deref(response.Body.TotalCount) {
-			break
-		}
-
-		startPage++
-	}
-
-	authZone, err := dns01.FindZoneByFqdn(domain)
-	if err != nil {
-		return "", fmt.Errorf("could not find zone: %w", err)
-	}
-
-	var hostedZone *alidns.DescribeDomainsResponseBodyDomainsDomain
-	for _, zone := range domains {
-		if ptr.Deref(zone.DomainName) == dns01.UnFqdn(authZone) || ptr.Deref(zone.PunyCode) == dns01.UnFqdn(authZone) {
-			hostedZone = zone
-		}
-	}
-
-	if hostedZone == nil || ptr.Deref(hostedZone.DomainId) == "" {
-		return "", fmt.Errorf("zone %s not found in AliDNS for domain %s", authZone, domain)
-	}
-
-	return ptr.Deref(hostedZone.DomainName), nil
-}
-
-func (d *DNSProvider) newTxtRecord(zone, fqdn, value string) (*alidns.AddDomainRecordRequest, error) {
-	rr, err := extractRecordName(fqdn, zone)
-	if err != nil {
-		return nil, err
-	}
-
-	return new(alidns.AddDomainRecordRequest).
-		SetType("TXT").
-		SetDomainName(zone).
-		SetRR(rr).
-		SetValue(value).
-		SetTTL(int64(d.config.TTL)), nil
-}
-
-func (d *DNSProvider) findTxtRecords(fqdn string) ([]*alidns.DescribeDomainRecordsResponseBodyDomainRecordsRecord, error) {
-	zoneName, err := d.getHostedZone(fqdn)
-	if err != nil {
-		return nil, err
-	}
-
-	request := new(alidns.DescribeDomainRecordsRequest).
-		SetDomainName(zoneName).
-		SetPageSize(500)
-
-	var records []*alidns.DescribeDomainRecordsResponseBodyDomainRecordsRecord
-
-	result, err := d.client.DescribeDomainRecords(request)
-	if err != nil {
-		return records, fmt.Errorf("API call has failed: %w", err)
-	}
-
-	recordName, err := extractRecordName(fqdn, zoneName)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, record := range result.Body.DomainRecords.Record {
-		if ptr.Deref(record.RR) == recordName && ptr.Deref(record.Type) == "TXT" {
-			records = append(records, record)
-		}
-	}
-	return records, nil
-}
-
-func extractRecordName(fqdn, zone string) (string, error) {
-	asciiDomain, err := idna.ToASCII(zone)
-	if err != nil {
-		return "", fmt.Errorf("fail to convert punycode: %w", err)
-	}
-
-	subDomain, err := dns01.ExtractSubDomain(fqdn, asciiDomain)
-	if err != nil {
-		return "", err
-	}
-
-	return subDomain, nil
 }

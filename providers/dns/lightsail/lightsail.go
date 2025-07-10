@@ -2,21 +2,20 @@
 package lightsail
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
+	"io"
+	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/retry"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/lightsail"
-	awstypes "github.com/aws/aws-sdk-go-v2/service/lightsail/types"
 	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/awsclient"
 )
 
 // Environment variables names.
@@ -33,6 +32,81 @@ const (
 const maxRetries = 5
 
 var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
+
+// AWS Lightsail API types
+type DomainEntry struct {
+	ID      *string           `json:"id,omitempty"`
+	Name    *string           `json:"name,omitempty"`
+	Target  *string           `json:"target,omitempty"`
+	IsAlias *bool             `json:"isAlias,omitempty"`
+	Type    *string           `json:"type,omitempty"`
+	Options map[string]string `json:"options,omitempty"`
+}
+
+type CreateDomainEntryRequest struct {
+	DomainName  string       `json:"domainName"`
+	DomainEntry *DomainEntry `json:"domainEntry"`
+}
+
+type DeleteDomainEntryRequest struct {
+	DomainName  string       `json:"domainName"`
+	DomainEntry *DomainEntry `json:"domainEntry"`
+}
+
+type GetDomainRequest struct {
+	DomainName string `json:"domainName"`
+}
+
+type Operation struct {
+	ID               *string   `json:"id,omitempty"`
+	ResourceName     *string   `json:"resourceName,omitempty"`
+	ResourceType     *string   `json:"resourceType,omitempty"`
+	CreatedAt        *float64  `json:"createdAt,omitempty"`
+	Location         *Location `json:"location,omitempty"`
+	IsTerminal       *bool     `json:"isTerminal,omitempty"`
+	OperationDetails *string   `json:"operationDetails,omitempty"`
+	OperationType    *string   `json:"operationType,omitempty"`
+	Status           *string   `json:"status,omitempty"`
+	StatusChangedAt  *float64  `json:"statusChangedAt,omitempty"`
+	ErrorCode        *string   `json:"errorCode,omitempty"`
+	ErrorDetails     *string   `json:"errorDetails,omitempty"`
+}
+
+type Location struct {
+	AvailabilityZone *string `json:"availabilityZone,omitempty"`
+	RegionName       *string `json:"regionName,omitempty"`
+}
+
+type CreateDomainEntryResponse struct {
+	Operation *Operation `json:"operation,omitempty"`
+}
+
+type DeleteDomainEntryResponse struct {
+	Operation *Operation `json:"operation,omitempty"`
+}
+
+type Domain struct {
+	Name          *string       `json:"name,omitempty"`
+	DomainEntries []DomainEntry `json:"domainEntries,omitempty"`
+}
+
+type GetDomainResponse struct {
+	Domain *Domain `json:"domain,omitempty"`
+}
+
+// LightsailClient represents a native Lightsail client
+type LightsailClient struct {
+	awsClient *awsclient.AWSClient
+}
+
+// NewLightsailClient creates a new Lightsail client
+func NewLightsailClient(creds *awsclient.AWSCredentials, maxRetries int) *LightsailClient {
+	endpoint := fmt.Sprintf("https://lightsail.%s.amazonaws.com", creds.Region)
+	awsClient := awsclient.NewAWSClient(creds, "lightsail", endpoint, maxRetries)
+	return &LightsailClient{
+		awsClient: awsClient,
+	}
+}
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -52,7 +126,7 @@ func NewDefaultConfig() *Config {
 
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
-	client *lightsail.Client
+	client *LightsailClient
 	config *Config
 }
 
@@ -83,34 +157,18 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("lightsail: the configuration of the DNS provider is nil")
 	}
 
-	ctx := context.Background()
-
-	cfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithRegion(config.Region),
-		awsconfig.WithRetryer(func() aws.Retryer {
-			return retry.NewStandard(func(options *retry.StandardOptions) {
-				options.MaxAttempts = maxRetries
-
-				// It uses a basic exponential backoff algorithm that returns an initial
-				// delay of ~400ms with an upper limit of ~30 seconds which should prevent
-				// causing a high number of consecutive throttling errors.
-				// For reference: Route 53 enforces an account-wide(!) 5req/s query limit.
-				options.Backoff = retry.BackoffDelayerFunc(func(attempt int, err error) (time.Duration, error) {
-					retryCount := min(attempt, 7)
-
-					delay := (1 << uint(retryCount)) * (rand.Intn(50) + 200)
-					return time.Duration(delay) * time.Millisecond, nil
-				})
-			})
-		}),
-	)
+	// Load AWS credentials
+	creds, err := loadAWSCredentials(config)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("lightsail: failed to load AWS credentials: %w", err)
 	}
+
+	// Create native Lightsail client
+	client := NewLightsailClient(creds, maxRetries)
 
 	return &DNSProvider{
 		config: config,
-		client: lightsail.NewFromConfig(cfg),
+		client: client,
 	}, nil
 }
 
@@ -119,16 +177,16 @@ func (d *DNSProvider) Present(domain, _, keyAuth string) error {
 	ctx := context.Background()
 	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	params := &lightsail.CreateDomainEntryInput{
-		DomainName: aws.String(d.config.DNSZone),
-		DomainEntry: &awstypes.DomainEntry{
-			Name:   aws.String(info.EffectiveFQDN),
-			Target: aws.String(strconv.Quote(info.Value)),
-			Type:   aws.String("TXT"),
+	request := &CreateDomainEntryRequest{
+		DomainName: d.config.DNSZone,
+		DomainEntry: &DomainEntry{
+			Name:   awsclient.StringPtr(info.EffectiveFQDN),
+			Target: awsclient.StringPtr(strconv.Quote(info.Value)),
+			Type:   awsclient.StringPtr("TXT"),
 		},
 	}
 
-	_, err := d.client.CreateDomainEntry(ctx, params)
+	_, err := d.client.CreateDomainEntry(ctx, request)
 	if err != nil {
 		return fmt.Errorf("lightsail: %w", err)
 	}
@@ -141,16 +199,16 @@ func (d *DNSProvider) CleanUp(domain, _, keyAuth string) error {
 	ctx := context.Background()
 	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	params := &lightsail.DeleteDomainEntryInput{
-		DomainName: aws.String(d.config.DNSZone),
-		DomainEntry: &awstypes.DomainEntry{
-			Name:   aws.String(info.EffectiveFQDN),
-			Type:   aws.String("TXT"),
-			Target: aws.String(strconv.Quote(info.Value)),
+	request := &DeleteDomainEntryRequest{
+		DomainName: d.config.DNSZone,
+		DomainEntry: &DomainEntry{
+			Name:   awsclient.StringPtr(info.EffectiveFQDN),
+			Type:   awsclient.StringPtr("TXT"),
+			Target: awsclient.StringPtr(strconv.Quote(info.Value)),
 		},
 	}
 
-	_, err := d.client.DeleteDomainEntry(ctx, params)
+	_, err := d.client.DeleteDomainEntry(ctx, request)
 	if err != nil {
 		return fmt.Errorf("lightsail: %w", err)
 	}
@@ -162,4 +220,121 @@ func (d *DNSProvider) CleanUp(domain, _, keyAuth string) error {
 // Adjusting here to cope with spikes in propagation times.
 func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 	return d.config.PropagationTimeout, d.config.PollingInterval
+}
+
+// loadAWSCredentials loads AWS credentials from various sources
+func loadAWSCredentials(config *Config) (*awsclient.AWSCredentials, error) {
+	return awsclient.LoadAWSCredentials(config.Region)
+}
+
+// CreateDomainEntry calls the Lightsail CreateDomainEntry API
+func (c *LightsailClient) CreateDomainEntry(ctx context.Context, request *CreateDomainEntryRequest) (*CreateDomainEntryResponse, error) {
+	body, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	resp, err := c.makeRequest(ctx, "CreateDomainEntry", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, c.handleErrorResponse(resp)
+	}
+
+	var response CreateDomainEntryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &response, nil
+}
+
+// DeleteDomainEntry calls the Lightsail DeleteDomainEntry API
+func (c *LightsailClient) DeleteDomainEntry(ctx context.Context, request *DeleteDomainEntryRequest) (*DeleteDomainEntryResponse, error) {
+	body, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	resp, err := c.makeRequest(ctx, "DeleteDomainEntry", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, c.handleErrorResponse(resp)
+	}
+
+	var response DeleteDomainEntryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &response, nil
+}
+
+// GetDomain calls the Lightsail GetDomain API
+func (c *LightsailClient) GetDomain(ctx context.Context, request *GetDomainRequest) (*GetDomainResponse, error) {
+	body, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	resp, err := c.makeRequest(ctx, "GetDomain", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, c.handleErrorResponse(resp)
+	}
+
+	var response GetDomainResponse
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &response, nil
+}
+
+// makeRequest makes an HTTP request with AWS Signature Version 4 authentication
+func (c *LightsailClient) makeRequest(ctx context.Context, action string, body []byte) (*http.Response, error) {
+	var bodyReader io.Reader
+	if body != nil {
+		bodyReader = bytes.NewReader(body)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.awsClient.Endpoint()+"/", bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set required headers
+	req.Header.Set("Content-Type", "application/x-amz-json-1.1")
+	req.Header.Set("X-Amz-Target", "Lightsail_20161128."+action)
+	if body != nil {
+		req.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	}
+
+	// Sign the request with AWS Signature Version 4
+	if err := c.awsClient.SignRequest(req, body); err != nil {
+		return nil, fmt.Errorf("failed to sign request: %w", err)
+	}
+
+	return c.awsClient.Do(req)
+}
+
+// handleErrorResponse handles error responses from AWS
+func (c *LightsailClient) handleErrorResponse(resp *http.Response) error {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("HTTP %d: failed to read error response", resp.StatusCode)
+	}
+
+	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 }

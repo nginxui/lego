@@ -5,18 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/retry"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
-	"github.com/aws/aws-sdk-go-v2/service/route53"
-	awstypes "github.com/aws/aws-sdk-go-v2/service/route53/types"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
@@ -30,6 +21,7 @@ const (
 
 	EnvAccessKeyID     = envNamespace + "ACCESS_KEY_ID"
 	EnvSecretAccessKey = envNamespace + "SECRET_ACCESS_KEY"
+	EnvSessionToken    = envNamespace + "SESSION_TOKEN"
 	EnvRegion          = envNamespace + "REGION"
 	EnvHostedZoneID    = envNamespace + "HOSTED_ZONE_ID"
 	EnvMaxRetries      = envNamespace + "MAX_RETRIES"
@@ -67,7 +59,7 @@ type Config struct {
 	PropagationTimeout time.Duration
 	PollingInterval    time.Duration
 
-	Client *route53.Client
+	Client *Route53Client
 }
 
 // NewDefaultConfig returns a default configuration for the DNSProvider.
@@ -89,7 +81,7 @@ func NewDefaultConfig() *Config {
 
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
-	client *route53.Client
+	client *Route53Client
 	config *Config
 }
 
@@ -118,15 +110,13 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return &DNSProvider{client: config.Client, config: config}, nil
 	}
 
-	ctx := context.Background()
-
-	cfg, err := createAWSConfig(ctx, config)
+	creds, err := loadAWSCredentials(config)
 	if err != nil {
 		return nil, err
 	}
 
 	return &DNSProvider{
-		client: route53.NewFromConfig(cfg),
+		client: NewRoute53Client(creds, config.MaxRetries),
 		config: config,
 	}, nil
 }
@@ -161,17 +151,17 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 	}
 
 	if !found {
-		records = append(records, awstypes.ResourceRecord{Value: aws.String(realValue)})
+		records = append(records, ResourceRecord{Value: &realValue})
 	}
 
-	recordSet := &awstypes.ResourceRecordSet{
-		Name:            aws.String(info.EffectiveFQDN),
+	recordSet := &ResourceRecordSet{
+		Name:            &info.EffectiveFQDN,
 		Type:            "TXT",
-		TTL:             aws.Int64(int64(d.config.TTL)),
+		TTL:             toInt64Ptr(int64(d.config.TTL)),
 		ResourceRecords: records,
 	}
 
-	err = d.changeRecord(ctx, awstypes.ChangeActionUpsert, hostedZoneID, recordSet)
+	err = d.changeRecord(ctx, "UPSERT", hostedZoneID, recordSet)
 	if err != nil {
 		return fmt.Errorf("route53: %w", err)
 	}
@@ -198,25 +188,25 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 		return nil
 	}
 
-	var nonLegoRecords []awstypes.ResourceRecord
+	var nonLegoRecords []ResourceRecord
 	for _, record := range existingRecords {
 		if ptr.Deref(record.Value) != `"`+info.Value+`"` {
 			nonLegoRecords = append(nonLegoRecords, record)
 		}
 	}
 
-	action := awstypes.ChangeActionUpsert
+	action := "UPSERT"
 
-	recordSet := &awstypes.ResourceRecordSet{
-		Name:            aws.String(info.EffectiveFQDN),
+	recordSet := &ResourceRecordSet{
+		Name:            &info.EffectiveFQDN,
 		Type:            "TXT",
-		TTL:             aws.Int64(int64(d.config.TTL)),
+		TTL:             toInt64Ptr(int64(d.config.TTL)),
 		ResourceRecords: nonLegoRecords,
 	}
 
 	// If the records are only records created by lego.
 	if len(nonLegoRecords) == 0 {
-		action = awstypes.ChangeActionDelete
+		action = "DELETE"
 
 		recordSet.ResourceRecords = existingRecords
 	}
@@ -229,19 +219,21 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 	return nil
 }
 
-func (d *DNSProvider) changeRecord(ctx context.Context, action awstypes.ChangeAction, hostedZoneID string, recordSet *awstypes.ResourceRecordSet) error {
-	recordSetInput := &route53.ChangeResourceRecordSetsInput{
-		HostedZoneId: aws.String(hostedZoneID),
-		ChangeBatch: &awstypes.ChangeBatch{
-			Comment: aws.String("Managed by Lego"),
-			Changes: []awstypes.Change{{
-				Action:            action,
-				ResourceRecordSet: recordSet,
-			}},
-		},
+func (d *DNSProvider) changeRecord(ctx context.Context, action string, hostedZoneID string, recordSet *ResourceRecordSet) error {
+	changeBatch := &ChangeBatch{
+		Comment: "Managed by Lego",
+		Changes: []Change{{
+			Action:            action,
+			ResourceRecordSet: recordSet,
+		}},
 	}
 
-	resp, err := d.client.ChangeResourceRecordSets(ctx, recordSetInput)
+	request := &ChangeResourceRecordSetsRequest{
+		Xmlns:       "https://route53.amazonaws.com/doc/2013-04-01/",
+		ChangeBatch: changeBatch,
+	}
+
+	resp, err := d.client.ChangeResourceRecordSets(ctx, hostedZoneID, request)
 	if err != nil {
 		return fmt.Errorf("failed to change record set: %w", err)
 	}
@@ -250,12 +242,12 @@ func (d *DNSProvider) changeRecord(ctx context.Context, action awstypes.ChangeAc
 
 	if d.config.WaitForRecordSetsChanged {
 		return wait.For("route53", d.config.PropagationTimeout, d.config.PollingInterval, func() (bool, error) {
-			resp, err := d.client.GetChange(ctx, &route53.GetChangeInput{Id: changeID})
+			resp, err := d.client.GetChange(ctx, ptr.Deref(changeID))
 			if err != nil {
 				return false, fmt.Errorf("failed to query change status: %w", err)
 			}
 
-			if resp.ChangeInfo.Status == awstypes.ChangeStatusInsync {
+			if resp.ChangeInfo.Status == "INSYNC" {
 				return true, nil
 			}
 
@@ -266,14 +258,8 @@ func (d *DNSProvider) changeRecord(ctx context.Context, action awstypes.ChangeAc
 	return nil
 }
 
-func (d *DNSProvider) getExistingRecordSets(ctx context.Context, hostedZoneID, fqdn string) ([]awstypes.ResourceRecord, error) {
-	listInput := &route53.ListResourceRecordSetsInput{
-		HostedZoneId:    aws.String(hostedZoneID),
-		StartRecordName: aws.String(fqdn),
-		StartRecordType: "TXT",
-	}
-
-	recordSetsOutput, err := d.client.ListResourceRecordSets(ctx, listInput)
+func (d *DNSProvider) getExistingRecordSets(ctx context.Context, hostedZoneID, fqdn string) ([]ResourceRecord, error) {
+	recordSetsOutput, err := d.client.ListResourceRecordSets(ctx, hostedZoneID, fqdn, "TXT")
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +268,7 @@ func (d *DNSProvider) getExistingRecordSets(ctx context.Context, hostedZoneID, f
 		return nil, nil
 	}
 
-	var records []awstypes.ResourceRecord
+	var records []ResourceRecord
 
 	for _, recordSet := range recordSetsOutput.ResourceRecordSets {
 		if ptr.Deref(recordSet.Name) == fqdn {
@@ -304,10 +290,7 @@ func (d *DNSProvider) getHostedZoneID(ctx context.Context, fqdn string) (string,
 	}
 
 	// .DNSName should not have a trailing dot
-	reqParams := &route53.ListHostedZonesByNameInput{
-		DNSName: aws.String(dns01.UnFqdn(authZone)),
-	}
-	resp, err := d.client.ListHostedZonesByName(ctx, reqParams)
+	resp, err := d.client.ListHostedZonesByName(ctx, dns01.UnFqdn(authZone))
 	if err != nil {
 		return "", err
 	}
@@ -330,68 +313,7 @@ func (d *DNSProvider) getHostedZoneID(ctx context.Context, fqdn string) (string,
 	return hostedZoneID, nil
 }
 
-func createAWSConfig(ctx context.Context, config *Config) (aws.Config, error) {
-	if err := createAWSConfigCheckParams(config); err != nil {
-		return aws.Config{}, err
-	}
-
-	optFns := []func(options *awsconfig.LoadOptions) error{
-		awsconfig.WithRetryer(func() aws.Retryer {
-			return retry.NewStandard(func(options *retry.StandardOptions) {
-				options.MaxAttempts = config.MaxRetries
-
-				// It uses a basic exponential backoff algorithm that returns an initial
-				// delay of ~400ms with an upper limit of ~30 seconds which should prevent
-				// causing a high number of consecutive throttling errors.
-				// For reference: Route 53 enforces an account-wide(!) 5req/s query limit.
-				options.Backoff = retry.BackoffDelayerFunc(func(attempt int, err error) (time.Duration, error) {
-					retryCount := min(attempt, 7)
-
-					delay := (1 << uint(retryCount)) * (rand.Intn(50) + 200)
-					return time.Duration(delay) * time.Millisecond, nil
-				})
-			})
-		}),
-	}
-
-	if config.AccessKeyID != "" && config.SecretAccessKey != "" {
-		optFns = append(optFns,
-			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(config.AccessKeyID, config.SecretAccessKey, config.SessionToken)),
-		)
-	}
-
-	if config.Region != "" {
-		optFns = append(optFns, awsconfig.WithRegion(config.Region))
-	}
-
-	cfg, err := awsconfig.LoadDefaultConfig(ctx, optFns...)
-	if err != nil {
-		return aws.Config{}, err
-	}
-
-	if config.AssumeRoleArn != "" {
-		cfg.Credentials = stscreds.NewAssumeRoleProvider(sts.NewFromConfig(cfg), config.AssumeRoleArn, func(options *stscreds.AssumeRoleOptions) {
-			if config.ExternalID != "" {
-				options.ExternalID = &config.ExternalID
-			}
-		})
-	}
-
-	return cfg, nil
-}
-
-func createAWSConfigCheckParams(config *Config) error {
-	if config == nil {
-		return errors.New("config is nil")
-	}
-
-	switch {
-	case config.SessionToken != "" && config.AccessKeyID == "" && config.SecretAccessKey == "":
-		return errors.New("SessionToken must be supplied with AccessKeyID and SecretAccessKey")
-
-	case config.AccessKeyID == "" && config.SecretAccessKey != "" || config.AccessKeyID != "" && config.SecretAccessKey == "":
-		return errors.New("AccessKeyID and SecretAccessKey must be supplied together")
-	}
-
-	return nil
+// Helper function to create int64 pointer
+func toInt64Ptr(v int64) *int64 {
+	return &v
 }
